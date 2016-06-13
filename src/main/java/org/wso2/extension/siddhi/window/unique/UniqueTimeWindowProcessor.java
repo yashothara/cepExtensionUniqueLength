@@ -27,46 +27,97 @@ import org.wso2.siddhi.core.executor.ConstantExpressionExecutor;
 import org.wso2.siddhi.core.executor.ExpressionExecutor;
 import org.wso2.siddhi.core.executor.VariableExpressionExecutor;
 import org.wso2.siddhi.core.query.processor.Processor;
-import org.wso2.siddhi.core.query.processor.stream.window.WindowProcessor;
+import org.wso2.siddhi.core.query.processor.SchedulingProcessor;
 import org.wso2.siddhi.core.query.processor.stream.window.FindableProcessor;
+import org.wso2.siddhi.core.query.processor.stream.window.WindowProcessor;
 import org.wso2.siddhi.core.table.EventTable;
+import org.wso2.siddhi.core.util.Scheduler;
 import org.wso2.siddhi.core.util.collection.operator.Finder;
 import org.wso2.siddhi.core.util.parser.CollectionOperatorParser;
+import org.wso2.siddhi.query.api.definition.Attribute;
 import org.wso2.siddhi.query.api.exception.ExecutionPlanValidationException;
 import org.wso2.siddhi.query.api.expression.Expression;
+
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Sample custom window.
- */
-public class UniqueTimeWindowProcessor extends WindowProcessor implements FindableProcessor {
-    private int length;
-    private int count = 0;
+/*
+* Sample Query:
+* from inputStream#window.unique:time(attribute1,3 sec)
+* select attribute1, attribute2
+* insert into outputStream;
+*
+* Description:
+* In the example query given, 3 is the duration of the window and attribute1 is the unique attribute.
+* According to the given attribute it will give unique events according to the given attribute within given time.
+* */
+public class UniqueTimeWindowProcessor extends WindowProcessor implements SchedulingProcessor, FindableProcessor {
+
+    private ConcurrentHashMap<String, StreamEvent> map = new ConcurrentHashMap<String, StreamEvent>();
+    private long timeInMilliSeconds;
     private ComplexEventChunk<StreamEvent> expiredEventChunk;
+    private Scheduler scheduler;
+    private ExecutionPlanContext executionPlanContext;
+    private volatile long lastTimestamp = Long.MIN_VALUE;
+    private VariableExpressionExecutor[] variableExpressionExecutors;
 
-    public int getLength() {
-        return length;
+    public void setTimeInMilliSeconds(long timeInMilliSeconds) {
+        this.timeInMilliSeconds = timeInMilliSeconds;
     }
 
-    public void setLength(int length) {
-        this.length = length;
+    /**
+     * The setScheduler method of the TimeWindowProcessor, As scheduler is private variable, to access publicly we
+     * use this setter method.
+     *
+     * @param scheduler the value of scheduler.
+     */
+    @Override
+    public void setScheduler(Scheduler scheduler) {
+        this.scheduler = scheduler;
     }
 
+    /**
+     * The getScheduler method of the TimeWindowProcessor, As scheduler is private variable, to access publicly we
+     * use this getter method.
+     */
+    @Override
+    public Scheduler getScheduler() {
+        return scheduler;
+    }
 
     /**
      * The init method of the WindowProcessor, this method will be called before other methods
      *
      * @param attributeExpressionExecutors the executors of each function parameters
      * @param executionPlanContext         the context of the execution plan
+     * @param outputExpectsExpiredEvents   is output is expecting expired events
      */
     @Override
-    protected void init(ExpressionExecutor[] attributeExpressionExecutors, ExecutionPlanContext executionPlanContext) {
-        expiredEventChunk = new ComplexEventChunk<StreamEvent>();
-        if (attributeExpressionExecutors.length == 1) {
-            length = (Integer) ((ConstantExpressionExecutor) attributeExpressionExecutors[0]).getValue();
+    protected void init(ExpressionExecutor[] attributeExpressionExecutors, ExecutionPlanContext executionPlanContext,
+                        boolean outputExpectsExpiredEvents) {
+        this.executionPlanContext = executionPlanContext;
+        this.expiredEventChunk = new ComplexEventChunk<StreamEvent>(false);
+        variableExpressionExecutors = new VariableExpressionExecutor[attributeExpressionExecutors.length - 1];
+        if (attributeExpressionExecutors.length == 2) {
+                variableExpressionExecutors[0] = (VariableExpressionExecutor) attributeExpressionExecutors[0];
+            if (attributeExpressionExecutors[1] instanceof ConstantExpressionExecutor) {
+                if (attributeExpressionExecutors[1].getReturnType() == Attribute.Type.INT) {
+                    timeInMilliSeconds = (Integer) ((ConstantExpressionExecutor) attributeExpressionExecutors[1]).getValue();
+
+                } else if (attributeExpressionExecutors[1].getReturnType() == Attribute.Type.LONG) {
+                    timeInMilliSeconds = (Long) ((ConstantExpressionExecutor) attributeExpressionExecutors[1]).getValue();
+                } else {
+                    throw new ExecutionPlanValidationException("Time window's parameter attribute for time should be either" +
+                            " int or long, but found " + attributeExpressionExecutors[0].getReturnType());
+                }
+            } else {
+                throw new ExecutionPlanValidationException("Time window should have constant parameter attribute for time but " +
+                        "found a dynamic attribute " + attributeExpressionExecutors[0].getClass().getCanonicalName());
+            }
         } else {
-            throw new ExecutionPlanValidationException("Length window should only have one parameter (<int> windowLength), but found " + attributeExpressionExecutors.length + " input attributes");
+            throw new ExecutionPlanValidationException("Time window should only have two parameters (<String> unique " +
+                    "attribute, <int|long|time> windowTime), but found " + attributeExpressionExecutors.length + " input attributes");
         }
     }
 
@@ -78,26 +129,61 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      * @param streamEventCloner helps to clone the incoming event for local storage or modification
      */
     @Override
-    protected synchronized void process(ComplexEventChunk<StreamEvent> streamEventChunk, Processor nextProcessor,
-                                        StreamEventCloner streamEventCloner) {
-        long currentTime = executionPlanContext.getTimestampGenerator().currentTime();
-        while (streamEventChunk.hasNext()) {
-            StreamEvent streamEvent = streamEventChunk.next();
-            StreamEvent clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
-            clonedEvent.setType(StreamEvent.Type.EXPIRED);
-            if (count < length) {
-                count++;
-                this.expiredEventChunk.add(clonedEvent);
-            } else {
-                StreamEvent firstEvent = this.expiredEventChunk.poll();
-                if (firstEvent != null) {
-                    firstEvent.setTimestamp(currentTime);
-                    streamEventChunk.insertBeforeCurrent(firstEvent);
+    protected void process(ComplexEventChunk<StreamEvent> streamEventChunk, Processor nextProcessor,
+                           StreamEventCloner streamEventCloner) {
+        synchronized (this) {
+            while (streamEventChunk.hasNext()) {
+                StreamEvent streamEvent = streamEventChunk.next();
+                long currentTime = executionPlanContext.getTimestampGenerator().currentTime();
+                StreamEvent oldEvent = null;
+                StreamEvent clonedEvent;
+                if (streamEvent.getType() == StreamEvent.Type.CURRENT) {
+                    clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
+                    clonedEvent.setType(StreamEvent.Type.EXPIRED);
+                    StreamEvent EventClonedForMap = streamEventCloner.copyStreamEvent(streamEvent);
+                    EventClonedForMap.setType(StreamEvent.Type.EXPIRED);
+                    oldEvent = map.put(generateKey(EventClonedForMap), EventClonedForMap);
                     this.expiredEventChunk.add(clonedEvent);
+                    if (lastTimestamp < clonedEvent.getTimestamp()) {
+                        scheduler.notifyAt(clonedEvent.getTimestamp() + timeInMilliSeconds);
+                        lastTimestamp = clonedEvent.getTimestamp();
+                    }
+                }
+                expiredEventChunk.reset();
+
+                while (expiredEventChunk.hasNext()) {
+                    StreamEvent expiredEvent = expiredEventChunk.next();
+                    long timeDiff = expiredEvent.getTimestamp() - currentTime + timeInMilliSeconds;
+                    if (timeDiff <= 0 || oldEvent != null) {
+                        if (oldEvent != null) {
+                            StreamEvent firstEventExpiredCloned = streamEventCloner.copyStreamEvent(expiredEvent);
+                            // firstEventExpiredCloned.setNext(null);
+                            if (firstEventExpiredCloned.equals(oldEvent)) {
+                                this.expiredEventChunk.remove();
+                                streamEventChunk.insertBeforeCurrent(oldEvent);
+                                oldEvent.setTimestamp(currentTime);
+                                expiredEventChunk.reset();
+                            }
+                        } else {
+                            expiredEventChunk.remove();
+                            expiredEvent.setTimestamp(currentTime);
+                            streamEventChunk.insertBeforeCurrent(expiredEvent);
+                            expiredEvent.setTimestamp(currentTime);
+                            expiredEventChunk.reset();
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                expiredEventChunk.reset();
+
+                if (streamEvent.getType() == StreamEvent.Type.CURRENT) {
+
                 } else {
-                    streamEventChunk.insertBeforeCurrent(clonedEvent);
+                    streamEventChunk.remove();
                 }
             }
+
         }
         nextProcessor.process(streamEventChunk);
     }
@@ -120,7 +206,7 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      * matchingEvent and the given matching expression logic.
      *
      * @param expression                  the matching expression
-     * @param metaComplexEvent            the meta structure of the incoming matchingEvent
+     * @param matchingMetaComplexEvent    the meta structure of the incoming matchingEvent
      * @param executionPlanContext        current execution plan context
      * @param variableExpressionExecutors the list of variable ExpressionExecutors already created
      * @param eventTableMap               map of event tables
@@ -130,12 +216,8 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      * matchingEvent
      */
     @Override
-    public Finder constructFinder(Expression expression, MetaComplexEvent metaComplexEvent,
-                                  ExecutionPlanContext executionPlanContext,
-                                  List<VariableExpressionExecutor> variableExpressionExecutors, Map<String,
-            EventTable> eventTableMap, int matchingStreamIndex, long withinTime) {
-        return CollectionOperatorParser.parse(expression, metaComplexEvent, executionPlanContext,
-                variableExpressionExecutors, eventTableMap, matchingStreamIndex, inputDefinition, withinTime);
+    public Finder constructFinder(Expression expression, MetaComplexEvent matchingMetaComplexEvent, ExecutionPlanContext executionPlanContext, List<VariableExpressionExecutor> variableExpressionExecutors, Map<String, EventTable> eventTableMap, int matchingStreamIndex, long withinTime) {
+        return CollectionOperatorParser.parse(expression, matchingMetaComplexEvent, executionPlanContext, variableExpressionExecutors, eventTableMap, matchingStreamIndex, inputDefinition, withinTime);
     }
 
     /**
@@ -146,7 +228,7 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      */
     @Override
     public void start() {
-        //Implement start logic to acquire relevant resources
+        //Do nothing
     }
 
     /**
@@ -156,7 +238,7 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      */
     @Override
     public void stop() {
-        //Implement stop logic to release the acquired resources
+        //Do nothing
     }
 
     /**
@@ -167,7 +249,7 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
      */
     @Override
     public Object[] currentState() {
-        return new Object[]{expiredEventChunk.getFirst(), count};
+        return new Object[]{expiredEventChunk.getFirst()};
     }
 
     /**
@@ -181,6 +263,20 @@ public class UniqueTimeWindowProcessor extends WindowProcessor implements Findab
     public void restoreState(Object[] state) {
         expiredEventChunk.clear();
         expiredEventChunk.add((StreamEvent) state[0]);
-        count = (Integer) state[1];
+    }
+
+    /**
+     * Used to generate key in map to get the old event for current event. It will map key which we give as unique
+     * attribute with the event
+     *
+     * @param event the stream event that need to be processed
+     */
+    private String generateKey(StreamEvent event) {
+        StringBuilder stringBuilder = new StringBuilder();
+        for (VariableExpressionExecutor executor : variableExpressionExecutors) {
+            stringBuilder.append(event.getAttribute(executor.getPosition()));
+        }
+        return stringBuilder.toString();
     }
 }
+

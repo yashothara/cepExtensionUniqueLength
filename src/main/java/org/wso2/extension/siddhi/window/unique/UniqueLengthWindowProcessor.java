@@ -1,3 +1,20 @@
+/*
+ * Copyright (c) 2016, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ *
+ * WSO2 Inc. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 package org.wso2.extension.siddhi.window.unique;
 
 import org.wso2.siddhi.core.config.ExecutionPlanContext;
@@ -17,11 +34,20 @@ import org.wso2.siddhi.core.util.collection.operator.Finder;
 import org.wso2.siddhi.core.util.parser.CollectionOperatorParser;
 import org.wso2.siddhi.query.api.exception.ExecutionPlanValidationException;
 import org.wso2.siddhi.query.api.expression.Expression;
-
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+/*
+* Sample Query:
+* from inputStream#window.unique:length(attribute1,3)
+* select attribute1, attribute2
+* insert into outputStream;
+*
+* Description:
+* In the example query given, 3 is the length of the window and attribute1 is the unique attribute.
+* According to the given attribute it will give unique events according to the given attribute within given length.
+* */
 public class UniqueLengthWindowProcessor extends WindowProcessor implements FindableProcessor {
     private ConcurrentHashMap<String, StreamEvent> map = new ConcurrentHashMap<String, StreamEvent>();
     private VariableExpressionExecutor[] variableExpressionExecutors;
@@ -34,18 +60,21 @@ public class UniqueLengthWindowProcessor extends WindowProcessor implements Find
      *
      * @param attributeExpressionExecutors the executors of each function parameters
      * @param executionPlanContext         the context of the execution plan
+     * @param outputExpectsExpiredEvents   is output is expecting expired events
      */
     @Override
-    protected void init(ExpressionExecutor[] attributeExpressionExecutors, ExecutionPlanContext executionPlanContext) {
-        expiredEventChunk = new ComplexEventChunk<StreamEvent>();
-        variableExpressionExecutors = new VariableExpressionExecutor[attributeExpressionExecutors.length-1];
+    protected void init(ExpressionExecutor[] attributeExpressionExecutors, ExecutionPlanContext executionPlanContext,
+                        boolean outputExpectsExpiredEvents) {
+        expiredEventChunk = new ComplexEventChunk<StreamEvent>(false);
+        variableExpressionExecutors = new VariableExpressionExecutor[attributeExpressionExecutors.length - 1];
         if (attributeExpressionExecutors.length == 2) {
             variableExpressionExecutors[0] = (VariableExpressionExecutor) attributeExpressionExecutors[0];
             length = (Integer) ((ConstantExpressionExecutor) attributeExpressionExecutors[1]).getValue();
         } else {
-            throw new ExecutionPlanValidationException("Unique Length window should only have one parameter (<string> attribute, <int> windowLength), but found " + attributeExpressionExecutors.length + " input attributes");
+            throw new ExecutionPlanValidationException("Unique Length window should only have two parameters " +
+                    "(<string> attribute, <int> windowLength), but found " + attributeExpressionExecutors.length +
+                    " input attributes");
         }
-
     }
 
     /**
@@ -56,32 +85,53 @@ public class UniqueLengthWindowProcessor extends WindowProcessor implements Find
      * @param streamEventCloner helps to clone the incoming event for local storage or modification
      */
     @Override
-    protected synchronized void process(ComplexEventChunk<StreamEvent> streamEventChunk, Processor nextProcessor, StreamEventCloner streamEventCloner) {
-        long currentTime = executionPlanContext.getTimestampGenerator().currentTime();
-        while (streamEventChunk.hasNext()) {
-            StreamEvent streamEvent = streamEventChunk.next();
-            StreamEvent clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
-            clonedEvent.setType(StreamEvent.Type.EXPIRED);
-            StreamEvent oldEvent=map.put(generateKey(clonedEvent),clonedEvent);
-            if ((count < length) || (oldEvent!=null)){
-                count++;
-                oldEvent.setTimestamp(currentTime);
-                streamEventChunk.add(oldEvent);
-                this.expiredEventChunk.add(clonedEvent);
-            } else {
-                StreamEvent firstEvent = this.expiredEventChunk.poll();
-                if (firstEvent != null) {
-                    firstEvent.setTimestamp(currentTime);
-                    streamEventChunk.insertBeforeCurrent(firstEvent);
+    protected void process(ComplexEventChunk<StreamEvent> streamEventChunk, Processor nextProcessor,
+                           StreamEventCloner streamEventCloner) {
+        synchronized (this) {
+            long currentTime = executionPlanContext.getTimestampGenerator().currentTime();
+            while (streamEventChunk.hasNext()) {
+                StreamEvent streamEvent = streamEventChunk.next();
+                streamEvent.setNext(null);
+                StreamEvent clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
+                StreamEvent EventClonedForMap = streamEventCloner.copyStreamEvent(streamEvent);
+                clonedEvent.setType(StreamEvent.Type.EXPIRED);
+                EventClonedForMap.setType(StreamEvent.Type.EXPIRED);
+                StreamEvent oldEvent = map.put(generateKey(EventClonedForMap), EventClonedForMap);
+                if (oldEvent == null) {
+                    count++;
+                }
+                if ((count <= length) && (oldEvent == null)) {
                     this.expiredEventChunk.add(clonedEvent);
-                } else {
-                    streamEventChunk.insertBeforeCurrent(clonedEvent);
+                }
+                if ((count > length) || (oldEvent != null)) {
+                    if (oldEvent != null) {
+                        while (expiredEventChunk.hasNext()) {
+                            StreamEvent firstEventExpired = expiredEventChunk.next();
+                            StreamEvent firstEventExpiredclonedEvent = streamEventCloner.copyStreamEvent(firstEventExpired);
+                            firstEventExpiredclonedEvent.setNext(null);
+                            if (firstEventExpiredclonedEvent.equals(oldEvent)) {
+                                this.expiredEventChunk.remove();
+                            }
+                        }
+                        this.expiredEventChunk.add(clonedEvent);
+                        streamEventChunk.insertBeforeCurrent(oldEvent);
+                        oldEvent.setTimestamp(currentTime);
+                    } else {
+                        StreamEvent firstEvent = this.expiredEventChunk.poll();
+                        if (firstEvent != null) {
+                            firstEvent.setTimestamp(currentTime);
+                            streamEventChunk.insertBeforeCurrent(firstEvent);
+                            this.expiredEventChunk.add(clonedEvent);
+                        } else {
+                            streamEventChunk.insertBeforeCurrent(clonedEvent);
+                        }
+                    }
                 }
             }
-            streamEventChunk.add(streamEvent);
         }
         nextProcessor.process(streamEventChunk);
     }
+
 
     /**
      * This will be called only once and this can be used to acquire
@@ -147,7 +197,7 @@ public class UniqueLengthWindowProcessor extends WindowProcessor implements Find
      * matchingEvent and the given matching expression logic.
      *
      * @param expression                  the matching expression
-     * @param matchingMetaComplexEvent            the meta structure of the incoming matchingEvent
+     * @param matchingMetaComplexEvent    the meta structure of the incoming matchingEvent
      * @param executionPlanContext        current execution plan context
      * @param variableExpressionExecutors the list of variable ExpressionExecutors already created
      * @param eventTableMap               map of event tables
@@ -157,11 +207,21 @@ public class UniqueLengthWindowProcessor extends WindowProcessor implements Find
      * matchingEvent
      */
     @Override
-    public Finder constructFinder(Expression expression, MetaComplexEvent matchingMetaComplexEvent, ExecutionPlanContext executionPlanContext, List<VariableExpressionExecutor> variableExpressionExecutors, Map<String, EventTable> eventTableMap, int matchingStreamIndex, long withinTime) {
-        return CollectionOperatorParser.parse(expression, matchingMetaComplexEvent, executionPlanContext, variableExpressionExecutors, eventTableMap, matchingStreamIndex, inputDefinition, withinTime);
+    public Finder constructFinder(Expression expression, MetaComplexEvent matchingMetaComplexEvent,
+                                  ExecutionPlanContext executionPlanContext, List<VariableExpressionExecutor>
+                                          variableExpressionExecutors, Map<String, EventTable> eventTableMap,
+                                  int matchingStreamIndex, long withinTime) {
+        return CollectionOperatorParser.parse(expression, matchingMetaComplexEvent, executionPlanContext,
+                variableExpressionExecutors, eventTableMap, matchingStreamIndex, inputDefinition, withinTime);
 
     }
 
+    /**
+     * Used to generate key in map to get the old event for current event. It will map key which we give as unique
+     * attribute with the event
+     *
+     * @param event the stream event that need to be processed
+     */
     private String generateKey(StreamEvent event) {
         StringBuilder stringBuilder = new StringBuilder();
         for (VariableExpressionExecutor executor : variableExpressionExecutors) {

@@ -17,3 +17,4 @@
 #
  
 length=org.wso2.extension.siddhi.window.unique.UniqueLengthWindowProcessor
+time=org.wso2.extension.siddhi.window.unique.UniqueTimeWindowProcessor

@@ -29,32 +29,30 @@ import org.wso2.siddhi.core.query.output.callback.QueryCallback;
 import org.wso2.siddhi.core.stream.input.InputHandler;
 import org.wso2.siddhi.core.util.EventPrinter;
 
-
 public class UniqueTimeWindowTestCase {
-    private static Logger logger = Logger.getLogger(UniqueLengthWindowTestCase.class);
-    protected static SiddhiManager siddhiManager;
+    private static final Logger log = Logger.getLogger(UniqueTimeWindowTestCase.class);
     private int inEventCount;
     private int removeEventCount;
-    private int count;
     private boolean eventArrived;
 
     @Before
     public void init() {
-        count = 0;
         inEventCount = 0;
         removeEventCount = 0;
         eventArrived = false;
     }
 
+    /**
+     * Commenting out intermittent failing test case until fix this properly.
+     */
     @Test
-    public void LengthWindow() throws InterruptedException {
-        logger.info("Testing UniqueTimeWindowProcessor length window with no of events smaller than window size");
+    public void uniqueTimeWindowTest1() throws InterruptedException {
 
         SiddhiManager siddhiManager = new SiddhiManager();
 
         String cseEventStream = "define stream cseEventStream (symbol string, price float, volume int);";
-        String query = "@info(name = 'query1') from cseEventStream#window.length(4) " +
-                "         select symbol,price,volume insert all events into outputStream ;";
+        String query = "@info(name = 'query1') from cseEventStream#window.unique:time(symbol, 2 sec) select symbol,price," +
+                "volume insert all events into outputStream ;";
 
         ExecutionPlanRuntime executionPlanRuntime = siddhiManager.createExecutionPlanRuntime(cseEventStream + query);
 
@@ -62,20 +60,99 @@ public class UniqueTimeWindowTestCase {
             @Override
             public void receive(long timeStamp, Event[] inEvents, Event[] removeEvents) {
                 EventPrinter.print(timeStamp, inEvents, removeEvents);
-                Assert.assertEquals("Message order inEventCount", inEventCount, inEvents[0].getData(2));
-                Assert.assertEquals("Events cannot be expired", false, inEvents[0].isExpired());
-                inEventCount = inEventCount + inEvents.length;
+                if (inEvents != null) {
+                    inEventCount = inEventCount + inEvents.length;
+                }
                 eventArrived = true;
             }
+
         });
 
         InputHandler inputHandler = executionPlanRuntime.getInputHandler("cseEventStream");
         executionPlanRuntime.start();
-        inputHandler.send(new Object[]{"IBM", 700f, 0});
-        inputHandler.send(new Object[]{"WSO2", 60.5f, 1});
-        Thread.sleep(500);
+        inputHandler.send(new Object[]{"IBM", 700f, 1});
+        inputHandler.send(new Object[]{"IBM", 60.5f, 2});
+        Thread.sleep(4000);
         Assert.assertEquals(2, inEventCount);
         Assert.assertTrue(eventArrived);
         executionPlanRuntime.shutdown();
     }
+
+    @Test
+    public void uniqueTimeWindowTest2() throws InterruptedException {
+
+        SiddhiManager siddhiManager = new SiddhiManager();
+
+        String cseEventStream = "define stream cseEventStream (symbol string, price float, volume int);";
+        String query = "@info(name = 'query1') from cseEventStream#window.unique:time(symbol, 1 sec) select symbol,price," +
+                "volume insert expired events into outputStream ;";
+
+        ExecutionPlanRuntime executionPlanRuntime = siddhiManager.createExecutionPlanRuntime(cseEventStream + query);
+
+        executionPlanRuntime.addCallback("query1", new QueryCallback() {
+            @Override
+            public void receive(long timeStamp, Event[] inEvents, Event[] removeEvents) {
+                EventPrinter.print(timeStamp, inEvents, removeEvents);
+                if (inEvents != null) {
+                    inEventCount = inEventCount + inEvents.length;
+                }
+                eventArrived = true;
+            }
+
+        });
+
+        InputHandler inputHandler = executionPlanRuntime.getInputHandler("cseEventStream");
+        executionPlanRuntime.start();
+        inputHandler.send(new Object[]{"IBM", 700f, 1});
+        inputHandler.send(new Object[]{"ABC", 60.5f, 2});
+        inputHandler.send(new Object[]{"IBM", 60.4f, 4});
+        Thread.sleep(1100);
+        inputHandler.send(new Object[]{"RRR", 700f, 3});
+        inputHandler.send(new Object[]{"WSO2", 60.5f, 7});
+        Thread.sleep(1100);
+        inputHandler.send(new Object[]{"IBM", 700f, 5});
+        inputHandler.send(new Object[]{"AAA", 60.5f, 6});
+        Thread.sleep(500);
+        Assert.assertEquals(0, inEventCount);
+        Assert.assertTrue(eventArrived);
+        executionPlanRuntime.shutdown();
+    }
+
+    @Test
+    public void uniqueTimeWindowTest3() throws InterruptedException {
+
+        SiddhiManager siddhiManager = new SiddhiManager();
+
+        String cseEventStream = "define stream cseEventStream (symbol string, price float, volume int);";
+        String query = "@info(name = 'query1') from cseEventStream#window.unique:time(symbol, 1 sec) select symbol,price," +
+                "volume insert current events into outputStream ;";
+
+        ExecutionPlanRuntime executionPlanRuntime = siddhiManager.createExecutionPlanRuntime(cseEventStream + query);
+
+        executionPlanRuntime.addCallback("query1", new QueryCallback() {
+            @Override
+            public void receive(long timeStamp, Event[] inEvents, Event[] removeEvents) {
+                EventPrinter.print(timeStamp, inEvents, removeEvents);
+                if (inEvents != null) {
+                    inEventCount = inEventCount + inEvents.length;
+                }
+                eventArrived = true;
+            }
+
+        });
+
+        InputHandler inputHandler = executionPlanRuntime.getInputHandler("cseEventStream");
+        executionPlanRuntime.start();
+        inputHandler.send(new Object[]{"IBM", 700f, 1});
+        inputHandler.send(new Object[]{"ABC", 60.5f, 2});
+        inputHandler.send(new Object[]{"IBM", 60.4f, 4});
+        Thread.sleep(1100);
+        inputHandler.send(new Object[]{"RRR", 700f, 3});
+        inputHandler.send(new Object[]{"WSO2", 60.5f, 7});
+        Thread.sleep(1100);
+        Assert.assertEquals(5, inEventCount);
+        Assert.assertTrue(eventArrived);
+        executionPlanRuntime.shutdown();
+    }
+
 }
